@@ -1,0 +1,1172 @@
+---
+title: "Malaria_test_code"
+author: "Yawo"
+date: "2025-06-10"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# load package
+
+```{r}
+rm(list = ls())
+library(dplyr)
+library(INLA)
+library(stats)
+library(data.table)
+library(tidyverse)
+library(here)
+library(sf)
+library(sp)
+library(spdep)
+library(dlnm)
+library(tsModel)
+library(hydroGOF)
+library(RColorBrewer)
+library(openxlsx)
+library(readxl)
+library(splines)
+library(geofacet)
+library(ggpubr)
+library(ggthemes)
+library(patchwork)
+library(car)
+```
+
+# Importe data
+
+```{r}
+load_and_process_map <- function(map_path = "./Data/Ghana_ERA5/Gha_geodata/District_261.shp",
+                                 Region_col = "Region",
+                                 District_col = "District",
+                                 geometry_col = "geometry",
+                                 output_dir = "test_malaria_ud_five",
+                                 snap = NULL){
+  # Validate output_dir
+  if (is.null(output_dir)) {
+    stop("output_dir must be provided to save the map.graph file.")
+  }
+  # Load and process map data
+  map <- read_sf(map_path)%>%
+    select(Region = Region_col,
+           District = District_col,
+           geometry = geometry_col)
+  # make valid geomtry
+  map$geometry <- st_make_valid(map$geometry)
+
+  # Create adjacency matrix
+  if (!file.exists(file.path(output_dir, "nbfile"))){
+    nb.map <- poly2nb(as_Spatial(map$geometry), snap = snap)
+    write.nb.gal(nb.map, file = file.path(output_dir, "nbfile"))
+  } else {
+    nb.map <- read.gal(file.path(output_dir, "nbfile"))
+  }
+  
+  g.file <- file.path(output_dir, "map.graph")
+  if (!file.exists(g.file)) {
+    nb2INLA(g.file, nb.map)
+  }
+
+  return(list(map = map, nb.map = nb.map))
+}
+
+load_and_process_map(snap = 1e-5)
+```
+
+# Health data
+```{r}
+load_and_process_data <- function(data_path= "Data_gh/Malaria_climate_gh_data_2013_2024.rds",
+                                  Region_col= "Region",
+                                  District_col= "District",
+                                  Date_col = NULL,
+                                  Year_col= "Year",
+                                  Month_col= "Month",
+                                  Malaria_case_col= "malaria_ud_five",
+                                  tot_pop_col= "pop_tot") {
+  # Load health and climate data
+  data <- readRDS(data_path)
+
+  # check if the column of dates exists otherwise check for year and months
+  if (!is.null(Date_col)){
+    if (!"Year" %in% names(data)){
+      data  <- data %>%
+        mutate(Year = year(Date_col))
+    } else if (!"Month" %in% names(data)){
+      data  <- data %>%
+        mutate(Month = month(Date_col))
+    } else {
+      stop("Neither the Date_col, Month_col and Year_col do not exist in the data.")
+    }
+  }
+
+  data <- data %>%
+    select(Region = Region_col, District = District_col, Year= Year_col, Month= Month_col,
+           Malaria = Malaria_case_col,
+           tot_pop = tot_pop_col) 
+  return(data)
+}
+
+load_and_process_data()
+```
+
+# Climate data
+
+```{r}
+load_and_process_climatedata <- function(data_path = "Data/Ghana_ERA5/Climate_data_gh.rds",
+                                         District_col = "District",
+                                         Year_col = "Year",
+                                         Month_col = "Month",
+                                         tmin_col = "tmin",
+                                         tmean_col = "tmean",
+                                         tmax_col = "tmax",
+                                         rainfall_col = "c_rain",
+                                         r_humidity_col = "rh",
+                                         runoff_col = NULL,
+                                         cvh_col = NULL,
+                                         Spi = NULL,
+                                         max_lag = 4) {
+  # Core and optional variables
+  var_map <- list(
+    District = District_col, Year = Year_col, Month = Month_col,
+    tmin = tmin_col, tmean = tmean_col, tmax = tmax_col,
+    rainfall = rainfall_col, r_humidity = r_humidity_col,
+    runoff = runoff_col, cvh = cvh_col, spi = Spi
+  )
+  
+  # Remove NULLs and build vectors
+  var_map <- var_map[!sapply(var_map, is.null)]
+  selected_cols <- as.character(var_map)        # Fix: convert to character vector
+  rename_vec <- setNames(selected_cols, names(var_map))
+  
+  # Read and rename
+  climate_data <- read_rds(data_path) %>%
+    dplyr::select(all_of(selected_cols)) %>%
+    dplyr::rename(!!!rename_vec)
+
+  # Helper to create lagged vars
+  create_lags <- function(df, var, max_lag) {
+    for (i in 1:max_lag) {
+      df[[paste0(var, "_lag", i)]] <- dplyr::lag(df[[var]], i)
+    }
+    df
+  }
+
+  # Apply lags to relevant variables
+  vars_to_lag <- intersect(names(rename_vec), 
+                           c("tmin", "tmean", "tmax", "rainfall", 
+                             "r_humidity", "runoff", "cvh", "spi"))
+  lagged_data <- lapply(vars_to_lag, function(var) create_lags(climate_data[var], 
+                                                               var, max_lag))
+
+  # Combine all
+  final_data <- bind_cols(climate_data[c("District", "Year", "Month")], 
+                          lagged_data)
+  return(final_data)
+}
+load_and_process_climatedata()
+```
+
+```{r}
+combine_health_climate_data <- function(health_data_path = "Data_gh/Malaria_climate_gh_data_2013_2024.rds",
+                                        climate_data_path = "Data/Ghana_ERA5/Climate_data_gh.rds",
+                                        map_path = "./Data/Ghana_ERA5/Gha_geodata/District_261.shp",
+                                        Region_col = "Region", 
+                                        District_col = "District", 
+                                        Date_col = NULL,
+                                        Year_col = "Year", 
+                                        Month_col = "Month", 
+                                        Malaria_case_col = "malaria_ud_five", 
+                                        tot_pop_col = "pop_tot", 
+                                        tmin_col = "tmin", 
+                                        tmean_col = "tmean", 
+                                        tmax_col = "tmax", 
+                                        rainfall_col = "c_rain",
+                                        r_humidity_col = "rh",
+                                        runoff_col = NULL,
+                                        cvh_col = NULL,
+                                        spi_col = NULL,
+                                        max_lag = 4,
+                                        geometry_col = "geometry", 
+                                        output_dir = "test_malaria_ud_five") {
+  
+  health_data <- load_and_process_data(health_data_path,
+                                       Region_col = Region_col,
+                                       District_col = District_col,
+                                       Date_col = Date_col,
+                                       Year_col = Year_col,
+                                       Month_col = Month_col,
+                                       Malaria_case_col = Malaria_case_col,
+                                       tot_pop_col = tot_pop_col)
+
+  climate_data <- load_and_process_climatedata(data_path = climate_data_path,
+                                               District_col = District_col,
+                                               Year_col = Year_col,
+                                               Month_col = Month_col,
+                                               tmin_col = tmin_col,
+                                               tmean_col = tmean_col,
+                                               tmax_col = tmax_col,
+                                               rainfall_col = rainfall_col,
+                                               r_humidity_col = r_humidity_col,
+                                               runoff_col = runoff_col,
+                                               cvh_col = cvh_col,
+                                               Spi = spi_col,
+                                               max_lag = max_lag)
+
+  map_data <- load_and_process_map(map_path = map_path,
+                                   Region_col = Region_col,
+                                   District_col = District_col,
+                                   geometry_col = geometry_col,
+                                   output_dir = output_dir)
+
+  data <- health_data %>%
+    left_join(climate_data, by = join_by(District, Year, Month)) %>%
+    group_by(Region, District) %>%
+    unique() %>%
+    mutate(time = (Year - min(Year)) * 12 + Month) %>%
+    ungroup()
+
+  grid_data <- data %>%
+    select(Region, District) %>%
+    distinct() %>%
+    group_by(Region) %>%
+    mutate(region_code = cur_group_id(),
+           district_number = row_number(),
+           district_code = sprintf("%d%01d", region_code, district_number)) %>%
+    ungroup()
+
+  data <- data %>%
+    left_join(grid_data, by = c("Region", "District")) %>%
+    arrange(region_code, district_code)
+
+  map <- map_data$map %>%
+    left_join(grid_data, by = c("Region", "District")) %>%
+    arrange(region_code, district_code)
+
+  grid_data <- grid_data %>%
+    rename(name = Region, Code_num = region_code)
+
+  summary_stats <- list(
+    tmin = summary(data$tmin),
+    tmax = summary(data$tmax),
+    rainfall = summary(data$rainfall),
+    rhumidity = summary(data$r_humidity)
+  )
+
+  return(list(map = map,
+              nb.map = map_data$nb.map,
+              data = data,
+              grid_data = grid_data,
+              summary = summary_stats))
+}
+combine_health_climate_data()
+```
+
+```{r}
+
+set_cross_basis <- function(data) {
+  nlag <- ncol(dplyr::select(data, dplyr::starts_with("tmax_lag")))
+
+  var_defs <- list(
+    tmax = "tmax_lag", tmin = "tmin_lag", tmean = "tmean_lag",
+    rainfall = "rainfall_lag", r_humidity = "r_humidity_lag",
+    runoff = "runoff_lag", cvh = "cvh_lag", spi = "spi_lag"
+  )
+
+  vars <- lapply(names(var_defs), function(var) {
+    base <- var
+    lags <- paste0(var_defs[[var]], 1:nlag)
+    cols <- c(base, lags)
+    if (all(cols %in% names(data))) data[, cols, drop = FALSE] else NULL
+  })
+  names(vars) <- names(var_defs)
+  vars <- vars[!sapply(vars, is.null)]
+
+  lagknot <- equalknots(0:nlag, 2)
+
+  basis_matrices <- lapply(names(vars), function(var) {
+    x <- vars[[var]]
+    cb <- crossbasis(
+      x,
+      argvar = list(fun = "ns", knots = equalknots(x[[1]], 2)),
+      arglag = list(fun = "ns", knots = nlag / 2)
+    )
+    colnames(cb) <- paste0("basis_", var, ".", colnames(cb))
+    cb
+  })
+
+  names(basis_matrices) <- names(vars)
+  return(basis_matrices)
+}
+
+set_cross_basis(data=combine_health_climate_data()$data)
+```
+
+
+```{r}
+create_inla_indices <- function(data) {
+  ntime <- length(unique(data$time))       # Total number of months
+  nyear <- length(unique(data$Year))       # Total number of years
+  ndistrict <- length(unique(data$district_code))  # Total number of districts
+  nregion <- length(unique(data$region_code))  # Total number of regions
+
+  # define the offset variable based on the population data
+  overall_rate <- sum(data$Malaria, na.rm = TRUE) / sum(data$tot_pop, na.rm = TRUE)
+  data$E <- overall_rate * data$tot_pop # Expected counts
+  data$SIR <- data$Malaria / data$E  # Standardized Incidence Ratio
+
+  # Create district index
+  data$district_index <- rep(1:ndistrict, length.out = nrow(data))  # Ensure correct length
+
+  # Assign district indices based on unique district codes
+  unique_districts <- unique(data$district_code)
+  for (j in 1:ndistrict) {
+    data$district_index[data$district_code == unique_districts[j]] <- j
+  }
+
+  # Create region index
+  data$region_index <- NA  # Initialize
+
+  # Assign region indices based on unique region codes
+  unique_regions <- unique(data$region_code)
+  for (j in 1:nregion) {
+    data$region_index[data$region_code == unique_regions[j]] <- j
+  }
+
+  # Create year index (first_year is the First year in the data set, is set to 1)
+  data$year_index <- data$Year - (min(data$Year)-1)
+
+  return(data)
+}
+
+create_inla_indices(data= combine_health_climate_data()$data )
+```
+
+
+
+```{r}
+run_inla_models <- function(data,
+                            basis_matrices_choices = c("tmax", "rainfall", "r_humidity", "runoff"),
+                            output_dir = "test_malaria_ud_five",
+                            save_csv = FALSE,
+                            family = "poisson",
+                            config = FALSE) {
+  if (save_csv && is.null(output_dir)) stop("output_dir must be provided if save_csv = TRUE")
+
+  data <- create_inla_indices(data)
+  basis_matrices <- set_cross_basis(data)
+
+  valid_vars <- intersect(basis_matrices_choices, names(basis_matrices))
+  if (length(valid_vars) == 0) stop("No valid variables found.")
+  if (any(missing <- !basis_matrices_choices %in% names(basis_matrices))) {
+    warning("Missing basis matrices for: ", paste(basis_matrices_choices[missing], collapse = ", "))
+  }
+
+  # Merge selected basis matrices into the data
+  for (var in valid_vars) {
+    data <- cbind(data, basis_matrices[[var]])
+  }
+
+  prior <- list(prec = list(prior = "pc.prec", param = c(0.5, 0.01)))
+  graph_file <- file.path(output_dir, "map.graph")
+  if (!file.exists(graph_file)) stop("Missing graph file: ", graph_file)
+
+  base_formula <- Malaria ~ 1 +
+    f(Month, replicate = region_index, model = "rw1", cyclic = TRUE, constr = TRUE,
+      scale.model = TRUE, hyper = prior) +
+    f(district_index, model = "bym2", replicate = year_index,
+      graph = graph_file, scale.model = TRUE, hyper = prior)
+
+  basis_terms <- unlist(lapply(valid_vars, function(v) colnames(basis_matrices[[v]])))
+  full_formula <- update(base_formula, as.formula(paste("~ . +", paste(basis_terms, 
+                                                                       collapse = " + "))))
+
+  fit_model <- function(f) inla.rerun(inla(
+    f, data = as.data.frame(data), family = family, offset = log(data$E),
+    control.inla = list(strategy = "adaptive"),
+    control.compute = list(dic = TRUE, config = config, cpo = TRUE, return.marginals = FALSE),
+    control.fixed = list(correlation.matrix = TRUE, prec.intercept = 1, prec = 1),
+    control.predictor = list(link = 1, compute = TRUE),
+    verbose = FALSE
+  ))
+
+  baseline_model <- fit_model(base_formula)
+  model <- fit_model(full_formula)
+
+  if (save_csv) {
+    save(model, baseline_model, file = file.path(output_dir, paste0("models_", paste(valid_vars, collapse = "_"), ".RData")))
+  }
+
+  cpo_vals <- model$cpo$cpo[model$cpo$failure == 0]
+  dic_table <- data.table(
+    Model = paste(valid_vars, collapse = " + "),
+    DIC = round(model$dic$dic, 0),
+    LogScore = round(mean(-log(cpo_vals), na.rm = TRUE), 3),
+    LPML = round(sum(log(cpo_vals), na.rm = TRUE), 2)
+  )
+
+  list(model = model, baseline_model = baseline_model, dic_table = dic_table)
+}
+
+a<-run_inla_models(data=combine_health_climate_data()$data)
+```
+
+
+```{r}
+plot_monthly_random_effects <- function(combined_data= combine_health_climate_data(), 
+                                        save_fig = FALSE,
+                                        model= a$model, 
+                                        output_dir="test_malaria_ud_five") {
+  # Validate output_dir if saving
+  if (save_fig & is.null(output_dir)) {
+    stop("output_dir must be provided if save_fig = TRUE")
+  }
+
+  data <- combined_data$data
+  grid_data <- combined_data$grid_data
+  map <- combined_data$map
+
+  # Create data frame for monthly random effects per region
+  month_effects <- data.frame(region_code = rep(unique(data$region_code), each = 12),
+                              Month = model$summary.random$Month)
+
+  # Merge with predefined state grid
+  month_effects <- month_effects %>%
+    left_join(grid_data %>% select(-District, -district_code) %>% unique(),
+              by = c("region_code" = "Code_num"))
+
+  month_effects <- map %>% select(-District) %>% unique() %>%
+    left_join(month_effects, by = c("Region" = "name"))
+
+  # Generate plot
+  p <- month_effects %>%
+    ggplot() +
+    geom_ribbon(aes(x = Month.ID, ymin = `Month.0.025quant`, ymax = `Month.0.975quant`),
+                fill = "cadetblue4", alpha = 0.5) +
+    geom_line(aes(x = Month.ID, y = Month.mean), col = "cadetblue4") +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey70") +
+    xlab("Month") +
+    ylab("Contribution to log(DIR)") +
+    scale_y_continuous() +
+    scale_x_continuous(breaks = c(1,4,7,10), labels = c("Jan", "Apr", "Jul", "Oct")) +
+    theme_bw() +
+    facet_wrap(~Region)
+
+  # Save plot
+  if (save_fig){
+    ggsave(file.path(output_dir, "monthly_random_effects.pdf"), plot = p, height = 30, width = 25, units = "cm")
+  }
+  return(p)
+}
+plot_monthly_random_effects()
+```
+
+
+```{r}
+yearly_spatial_random_effect <- function(combined_data = combine_health_climate_data(), 
+                                         model = a$model,
+                                         save_fig = FALSE,
+                                         output_dir = "test_malaria_ud_five") {
+  if (save_fig && is.null(output_dir)) {
+    stop("output_dir must be provided if save_fig = TRUE")
+  }
+  # Extract necessary components
+  data <- create_inla_indices(combined_data$data)
+  grid_data <- combined_data$grid_data
+  map <- combined_data$map
+  
+  nyear <- length(unique(data$Year))
+  ndistrict <- length(unique(data$district_code))
+  
+  # Extract spatial random effects (unstructured + structured)
+  space <- data.table(model$summary.random$district_index)
+  space$Year <- rep(min(data$Year):max(data$Year), each = 2 * ndistrict)
+  space$re <- rep(c(rep(1, ndistrict), rep(2, ndistrict)), nyear)
+  space <- space[space$re == 1, ]
+  space$District_code <- rep(unique(data$district_code), nyear)
+  
+  # Merge with spatial data
+  space <- left_join(map, space, by = c("district_code" = "District_code"))
+  
+  # Define color scale limits symmetrically
+  lim <- max(abs(space$mean), na.rm = TRUE)
+  
+  # Create map
+  space_effects <- ggplot() +
+    geom_sf(data = space, aes(fill = mean), lwd = 0.1, color = "grey60") +
+    scale_fill_gradient2(
+      name = "Contribution to\nlog(MIR)",
+      low = "darkgreen", mid = "white", high = "darkred",
+      midpoint = 0, limits = c(-lim, lim), breaks = c(-lim, 0, lim)
+    ) +
+    facet_wrap(~Year, ncol = 5) +
+    theme_void(base_size = 12) +
+    theme(
+      strip.text = element_text(size = 12, face = "bold"),
+      legend.title = element_text(size = 10),
+      legend.text = element_text(size = 9),
+      legend.position = "right"
+    )
+
+  # Save figure
+  if (save_fig) {
+    ggsave(
+      file.path(output_dir, "Yearly_random_effects_improved.pdf"),
+      plot = space_effects, height = 30, width = 25, units = "cm", dpi = 300
+    )
+  }
+
+  return(space_effects)
+}
+
+
+yearly_spatial_random_effect()
+```
+
+
+```{r}
+get_predictions <- function(data = combine_health_climate_data()$data,
+                            param_terms = "tmax",
+                            model = a$model,
+                            level = "District") {
+  
+  data <- create_inla_indices(data)
+  basis <- set_cross_basis(data)[[param_terms]]
+  coef <- model$summary.fixed$mean
+  vcov <- model$misc$lincomb.derived.covariance.matrix
+  indt <- grep(paste0("basis_", param_terms), model$names.fixed)
+
+  compute_pred <- function(sub_data) {
+    cen_val <- round(mean(sub_data[[param_terms]], na.rm = TRUE), 0)
+    crosspred(basis, coef = coef[indt], vcov = vcov[indt, indt],
+              model.link = "log", bylag = 0.25, cen = cen_val)
+  }
+
+  if (level == "country") {
+    return(compute_pred(data))
+  }
+
+  group_var <- switch(level,
+                      "Region" = "Region",
+                      "District" = "District",
+                      stop("Invalid level. Choose from 'country', 'Region', or 'District'"))
+
+  groups <- unique(data[[group_var]])
+  preds <- lapply(groups, function(g) compute_pred(subset(data, data[[group_var]] == g)))
+  names(preds) <- groups
+  return(preds)
+}
+get_predictions()
+```
+
+
+```{r}
+contour_plot <- function(data= combine_health_climate_data()$data,
+                         param_terms= "tmax",
+                         model= a$model,
+                         level = "country",
+                         year = NULL,
+                         save_fig = TRUE,
+                         output_dir = "test_malaria_ud_five") {
+
+  if (save_fig && is.null(output_dir)) {
+    stop("output_dir must be provided if save_fig = TRUE")
+  }
+
+  output_file <- file.path(output_dir,
+                           paste0("contour_plot_", param_terms, "_", level,
+                                  if (!is.null(year)) paste0("_", paste(year, collapse = "_")), ".pdf"))
+
+  data <- create_inla_indices(data)
+  # Optional filtering by year
+  if (!is.null(year)) {
+    if (!"Year" %in% names(data)) stop("'Year' column not found in data.")
+    data <- filter(data, Year %in% year)
+    }
+  # Get predictions
+  predt <- get_predictions(data, param_terms = param_terms, model, level = level)
+
+  # Common plotting utility
+  plot_contour <- function(x, y, z, title) {
+    nlag <- max(x)
+    pal <- rev(brewer.pal(11, "PRGn"))
+    levels <- pretty(range(z, na.rm = TRUE), 20)
+    col1 <- colorRampPalette(pal[1:6])
+    col2 <- colorRampPalette(pal[6:11])
+    cols <- c(col1(sum(levels <= 1)), col2(sum(levels > 1)))
+    filled.contour(
+      x, y, z,
+      xlab = "Lag",
+      ylab = ifelse(param_terms == "tmax", "Temperature (°C)",
+                    ifelse(param_terms == "rainfall", "Rainfall (mm)", param_terms)),
+      main = title,
+      col = cols,
+      levels = levels,
+      plot.axes = {
+        axis(1, at = 0:nlag, labels = 0:nlag)
+        axis(2)
+      }
+    )
+  }
+
+  # PDF device
+  if (save_fig) pdf(output_file, width = 8, height = 8)
+
+  nlag <- data %>% select(contains(param_terms)) %>% ncol() - 1
+  lag_seq <- seq(0, nlag, 0.25)
+
+  if (level == "country") {
+    y <- predt$predvar
+    z <- t(predt$matRRfit)
+    plot_contour(lag_seq, y, z, title = "Contour Plot for Country")
+
+  } else {
+    groups <- if (level == "Region") unique(data$Region) else unique(data$District)
+
+    for (grp in groups) {
+      y <- predt[[grp]]$predvar
+      z <- t(predt[[grp]]$matRRfit)
+      plot_contour(lag_seq, y, z, title = paste("Contour Plot for", grp))
+    }
+  }
+
+  if (save_fig) dev.off()
+}
+
+contour_plot()
+```
+
+
+```{r}
+plot_rr_map <- function(combined_data = combine_health_climate_data(),
+                        model= a$model,
+                        param_terms = "tmax",
+                        level = "District",
+                        year = NULL,
+                        output_dir = "test_malaria_ud_five",
+                        save_fig = TRUE) {
+  data <- combined_data$data
+  map <- combined_data$map
+
+  stopifnot("Year" %in% names(data))
+  if (save_fig && is.null(output_dir)) stop("output_dir must be provided if save_fig = TRUE")
+
+  years <- if (is.null(year)) sort(unique(data$Year)) else {
+    stopifnot(year %in% data$Year)
+    year
+  }
+
+  grouping_var <- ifelse(level == "District", "District", "Region")
+
+  create_rr_df <- function(predt) {
+    map_dfr(names(predt), function(name) {
+      vals <- predt[[name]]
+      if (anyNA(vals$allRRfit)) return(NULL)
+      tibble(
+        !!grouping_var := name,
+        RR = mean(vals$allRRfit, na.rm = TRUE),
+        RR_low = min(vals$allRRlow, na.rm = TRUE),
+        RR_high = max(vals$allRRhigh, na.rm = TRUE)
+      )
+    })
+  }
+
+  plots <- lapply(years, function(yr) {
+    message("Processing year: ", yr)
+    predt <- get_predictions(filter(data, Year == yr), param_terms, model, level)
+    map_rr <- left_join(map, create_rr_df(predt), by = grouping_var)
+
+    ggplot(map_rr) +
+      geom_sf(aes(fill = RR), color = "black", size = 0.2) +
+      scale_fill_viridis_c(option = "C", name = "RR", na.value = "grey80") +
+      theme_minimal() +
+      labs(title = paste("Year:", yr), subtitle = paste("Exposure:", param_terms)) +
+      theme(axis.text = element_blank(), axis.ticks = element_blank(), panel.grid = element_blank())
+  })
+
+  combined_plot <- wrap_plots(plots) +
+    plot_annotation(
+      title = paste("Relative Risk of Malaria by", level),
+      subtitle = paste("Exposure:", param_terms),
+      theme = theme(plot.title = element_text(size = 16, face = "bold"))
+      )
+  if (save_fig) {
+    ggsave(file.path(output_dir, paste0("RR_map_", param_terms, "_", level, "_all_years.pdf")),
+           combined_plot, width = 14, height = 10)
+  }
+  invisible(combined_plot)
+}
+
+plot_rr_map()
+```
+
+
+```{r}
+plot_relative_risk <- function(data= combine_health_climate_data()$data,
+                               model=a$model,
+                               param_terms= "rainfall",
+                               level = "Region",
+                               year = NULL,
+                               output_dir = "test_malaria_ud_five",
+                               save_fig = TRUE) {
+
+  if (!"Year" %in% names(data)) stop("'Year' column not found in data.")
+  if (is.null(year)) year <- sort(unique(data$Year))
+  if (save_fig && !dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+  output_pdf <- file.path(output_dir, paste0("RR_", param_terms, "_", tolower(level), "_all_plots.pdf"))
+
+  build_plot <- function(pred, yr) {
+    if (anyNA(pred$allRRfit)) return(NULL)
+    ggplot(tibble(x = pred$predvar, y = pred$allRRfit, ymin = pred$allRRlow, ymax = pred$allRRhigh),
+           aes(x, y)) +
+      geom_line(color = "red", linewidth = 1) +
+      geom_ribbon(aes(ymin = ymin, ymax = ymax), fill = "red", alpha = 0.3) +
+      geom_hline(yintercept = 1, linetype = "dashed", color = "gray", linewidth = 0.5) +
+      labs(title = yr, x = param_terms, y = "Relative Risk") +
+      theme_minimal() + theme(plot.title = element_text(size = 9))
+    }
+
+  if (level == "country") {
+    plots <- lapply(year, function(yr) {
+      build_plot(get_predictions(filter(data, Year == yr), param_terms, model, level), yr)
+    }) %>% Filter(Negate(is.null), .)
+
+    if (save_fig) {
+      pdf(output_pdf, width = 14, height = 10)
+      walk(plots, print)
+      dev.off()
+    }
+    return(invisible(wrap_plots(plots) + plot_annotation(
+      title = paste("Exposure-Response Curves by Country"),
+      subtitle = paste(param_terms, "Years:", paste(year, collapse = ", "))
+    )))
+  }
+
+  # Region/District: gather plots per group per year
+  group_plots <- list()
+  for (yr in year) {
+    preds <- get_predictions(filter(data, Year == yr), param_terms, model, level)
+    for (grp in names(preds)) {
+      p <- build_plot(preds[[grp]], yr)
+      if (!is.null(p)) group_plots[[grp]] <- c(group_plots[[grp]], list(p))
+    }
+  }
+  if (save_fig) {
+    pdf(output_pdf, width = 10, height = 8)
+    for (grp in names(group_plots)) {
+      print(wrap_plots(group_plots[[grp]]) + plot_annotation(
+        title = paste("Exposure-Response Curves:", grp),
+        subtitle = paste(param_terms, "Years:", paste(year, collapse = ", "))
+      ))
+    }
+    dev.off()
+  }
+  invisible(NULL)
+}
+
+plot_relative_risk()
+
+```
+
+
+
+```{r}
+attribution_calculation <- function(data = combine_health_climate_data()$data,
+                                    param_terms = "tmax",
+                                    model = a$model,
+                                    param_threshold = 1,
+                                    attrdl_path = "attrdl.R",
+                                    level = "country",
+                                    year = 2018) {
+  source(attrdl_path)
+
+  coef <- model$summary.fixed$mean
+  vcov <- model$misc$lincomb.derived.covariance.matrix
+  indt <- grep(paste0("basis_", param_terms), model$names.fixed)
+
+  if (length(indt) == 0) stop("No terms associated with 'basis_", param_terms, "' found in the model.")
+  if (!is.null(year)) {
+    if (!"Year" %in% names(data)) stop("'Year' column not found in data.")
+    if (!all(year %in% unique(data$Year))) {
+      stop("Some specified years not found in data.")
+    }
+    data <- filter(data, Year %in% year)
+  }
+
+  compute_attr_metrics <- function(df, basis_matrix) {
+    if (nrow(df) == 0 || all(is.na(df[[param_terms]]))) return(NULL)
+
+    cen <- mean(df[[param_terms]], na.rm = TRUE)
+    range_vals <- seq(min(df[[param_terms]], na.rm = TRUE),
+                      max(df[[param_terms]], na.rm = TRUE), by = 0.1)
+
+    predt <- crosspred(basis_matrix[[param_terms]], coef = coef[indt],
+                       vcov = vcov[indt, indt], model.link = "log",
+                       at = range_vals, cen = cen)
+
+    mr <- predt$predvar[which.min(predt$allRRfit)]
+    high_range <- range_vals[predt$allRRfit > param_threshold]
+    if (length(high_range) == 0) return(NULL)
+    high_bounds <- range(high_range)
+
+    an_num <- round(attrdl(df[[param_terms]], basis_matrix[[param_terms]], df$Malaria,
+                           coef = coef[indt], vcov = vcov[indt, indt],
+                           type = "an", cen = mr, dir = "forw", range = high_bounds))
+
+    an_frac <- round(attrdl(df[[param_terms]], basis_matrix[[param_terms]], df$Malaria,
+                            coef = coef[indt], vcov = vcov[indt, indt],
+                            type = "af", cen = mr, dir = "forw", range = high_bounds) * 100, 2)
+
+    list(MRT = round(mr, 2),
+         High_Lower = round(high_bounds[1], 2),
+         High_Upper = round(high_bounds[2], 2),
+         Attributable_Risk_Number = an_num,
+         Attributable_Risk_Fraction = an_frac)
+  }
+
+  if (level == "country") {
+    basis_matrix <- set_cross_basis(data)
+    out <- compute_attr_metrics(data, basis_matrix)
+    return(out)
+
+  } else if (level == "Region") {
+    results <- data %>%
+      group_by(Region, Year) %>%
+      group_split() %>%
+      map_dfr(function(df) {
+        res <- compute_attr_metrics(df, set_cross_basis(df))
+        if (is.null(res)) return(NULL)
+        tibble(Region = unique(df$Region), Year = unique(df$Year), !!!res)
+      })
+
+    return(results)
+
+  } else if (level == "District") {
+    results <- data %>%
+      group_by(Region, District, Year) %>%
+      group_split() %>%
+      map_dfr(function(df) {
+        res <- compute_attr_metrics(df, set_cross_basis(df))
+        if (is.null(res)) return(NULL)
+        tibble(Region = unique(df$Region),
+               District = unique(df$District),
+               Year = unique(df$Year),
+               !!!res)
+      })
+
+    return(results)
+  } else {
+    stop("Invalid level. Must be one of 'country', 'Region', or 'District'.")
+  }
+}
+
+attribution_calculation()
+```
+
+```{r}
+attribution_calculation <- function(data = combine_health_climate_data()$data,
+                                    param_terms = "tmax",
+                                    model = a$model,
+                                    param_threshold = 1,
+                                    attrdl_path = "attrdl.R",
+                                    level = "Region",
+                                    year = NULL) {
+  source(attrdl_path)
+
+  coef <- model$summary.fixed$mean
+  vcov <- model$misc$lincomb.derived.covariance.matrix
+  indt <- grep(paste0("basis_", param_terms), model$names.fixed)
+  if (length(indt) == 0) stop("No terms for 'basis_", param_terms, "' found in model.")
+
+  if (!is.null(year)) {
+    stopifnot("Year" %in% names(data), all(year %in% unique(data$Year)))
+    data <- dplyr::filter(data, Year %in% year)
+  }
+
+  compute_metrics <- function(df) {
+    if (nrow(df) == 0 || all(is.na(df[[param_terms]]))) return(NULL)
+    basis <- set_cross_basis(df)[[param_terms]]
+    cen <- mean(df[[param_terms]], na.rm = TRUE)
+    at_vals <- seq(min(df[[param_terms]], na.rm = TRUE),
+                   max(df[[param_terms]], na.rm = TRUE), 0.1)
+
+    pred <- crosspred(basis, coef = coef[indt], vcov = vcov[indt, indt],
+                      model.link = "log", at = at_vals, cen = cen)
+
+    high_vals <- at_vals[pred$allRRfit > param_threshold]
+    if (length(high_vals) == 0) return(NULL)
+    bounds <- range(high_vals)
+    ref_temp <- pred$predvar[which.min(pred$allRRfit)]
+
+    an_num <- round(attrdl(df[[param_terms]], basis, df$Malaria,
+                           coef = coef[indt], vcov = vcov[indt, indt],
+                           type = "an", cen = ref_temp, dir = "forw", range = bounds))
+    an_frac <- round(attrdl(df[[param_terms]], basis, df$Malaria,
+                            coef = coef[indt], vcov = vcov[indt, indt],
+                            type = "af", cen = ref_temp, dir = "forw", range = bounds) * 100, 2)
+    pop <- sum(df$tot_pop, na.rm = TRUE)
+    cases_100k <- if (pop > 0) round((an_num / pop) * 1e5, 0) else NA
+
+    list(MRT = round(ref_temp, 2), High_Lower = round(bounds[1], 2),
+         High_Upper = round(bounds[2], 2), AR_Number = an_num,
+         AR_Fraction = an_frac, AR_per_100k = cases_100k)
+  }
+
+  group_and_compute <- function(grp_vars) {
+    data %>%
+      dplyr::group_by(across(all_of(grp_vars))) %>%
+      dplyr::group_split() %>%
+      purrr::map_dfr(~{
+        res <- compute_metrics(.x)
+        if (is.null(res)) return(NULL)
+        dplyr::tibble(!!!.x[1, grp_vars], !!!res)
+      })
+  }
+
+  switch(level,
+         "country" = compute_metrics(data),
+         "Region" = group_and_compute(c("Region", "Year")),
+         "District" = group_and_compute(c("Region", "District", "Year")),
+         stop("Invalid level. Choose 'country', 'Region', or 'District'."))
+}
+
+attribution_calculation()
+```
+
+
+```{r}
+Malaria_do_analysis <- function(health_data_path = "Data_gh/Malaria_climate_gh_data_2013_2024.rds",
+                                climate_data_path = "Data/Ghana_ERA5/Climate_data_gh.rds",
+                                map_path = "./Data/Ghana_ERA5/Gha_geodata/District_261.shp",
+                                Region_col = "Region", 
+                                District_col = "District",
+                                Date_col = NULL,
+                                Year_col = "Year", 
+                                Month_col = "Month", 
+                                Malaria_case_col = "malaria_ud_five", 
+                                tot_pop_col = "pop_tot", 
+                                tmin_col = "tmin", 
+                                tmean_col = "tmean", 
+                                tmax_col = "tmax", 
+                                rainfall_col = "c_rain",
+                                r_humidity_col = "rh",
+                                runoff_col = NULL,
+                                cvh_col = NULL,
+                                spi_col = NULL,
+                                max_lag = 4,
+                                geometry_col = "geometry",
+                                basis_matrices_choices = c("tmax","rainfall", "r_humidity","runoff"),
+                                param_terms = "tmax",
+                                level = "country",
+                                save_fig = TRUE,
+                                param_threshold = 1,
+                                year= NULL,
+                                family = "poisson",
+                                config = FALSE,
+                                save_csv = FALSE,
+                                output_dir = "test_diarrhea_gh"){
+
+  # get combined data
+  combined_data <- combine_health_climate_data(health_data_path,
+                                               climate_data_path,
+                                               map_path,
+                                               Region_col,
+                                               District_col,
+                                               Date_col,
+                                               Year_col,
+                                               Month_col,
+                                               Malaria_case_col,
+                                               tot_pop_col,
+                                               tmin_col,
+                                               tmean_col,
+                                               tmax_col,
+                                               rainfall_col,
+                                               r_humidity_col,
+                                               runoff_col,
+                                               cvh_col,
+                                               spi_col,
+                                               max_lag,
+                                               geometry_col,
+                                               output_dir)
+
+  #Base matrice
+  set_cross_basis(combined_data$data)
+
+  # data for INLA
+  data_inla <- create_inla_indices(combined_data$data)
+
+  # fitting the model
+  
+  a <- run_inla_models(data_inla, basis_matrices_choices,output_dir = output_dir, 
+                       save_csv= save_csv, family = family, config =config )
+
+  #
+  reff_plot_monthly <- plot_monthly_random_effects(combined_data, model = a$model,
+                                                   output_dir = output_dir)
+
+  #
+  reff_plot_yearly <- yearly_spatial_random_effect(combined_data, model = a$model,
+                                                   output_dir = output_dir)
+
+  # contour plots
+  Contour_plot <- contour_plot(combined_data$data, param_terms, model=a$model,
+                               level = level, output_dir = output_dir,
+                               save_fig=save_fig, year=year)
+  # rr map plots
+  rr_map_plot <- plot_rr_map(combined_data, param_terms, model=a$model,
+                             level = "District", year=year, output_dir = output_dir,
+                             save_fig=save_fig)
+
+  # relative ristk plot
+  rr_plot <- plot_relative_risk(combined_data$data, param_terms = param_terms,
+                                model = a$model,level = level, year=year,
+                                output_dir = output_dir, save_fig = save_fig)
+
+  # attribution fraction and number
+  attr_frac_num <- attribution_calculation(combined_data$data,
+                                           param_terms = param_terms,
+                                           model = a$model,
+                                           param_threshold = param_threshold,
+                                           level = level, year=year)
+
+  res <- list(a, reff_plot_monthly, reff_plot_yearly, Contour_plot, rr_map_plot,
+              rr_plot, attr_frac_num)
+
+  return(res)
+}
+Malaria_do_analysis()
+```
+
+```{r}
+
+plot_all_attributable_metrics <- function(attr_data,
+                                          level,
+                                          metrics,
+                                          filter_year,
+                                          focus_area = NULL,
+                                          save_fig = FALSE,
+                                          output_dir = NULL) {
+  level <- tolower(level)
+  valid_metrics <- c("AR_Number", "AR_Fraction", "AR_per_100k")
+  metrics <- intersect(metrics, valid_metrics)
+  if (length(metrics) == 0) stop("No valid metrics selected.")
+  
+  if (!is.null(filter_year)) {
+    stopifnot("year" %in% names(attr_data))
+    attr_data <- dplyr::filter(attr_data, year %in% filter_year)
+  }
+  
+  attr_data$year <- as.numeric(as.character(attr_data$year))
+  
+  metric_labels <- c(
+    AR_Number = "Attributable Number",
+    AR_Fraction = "Attributable Fraction (%)",
+    AR_per_100k = "Per 100,000 population"
+  )
+  
+  # Determine fill and x variables
+  area_col <- switch(level, district = "district", region = "region", country = "Metric")
+  x_var <- if (level == "country") "year" else "region"
+  fill_var <- area_col
+  
+  # Filter focus_area if applicable
+  if (!is.null(focus_area)) {
+    area_col <- tolower(level)
+    if (area_col %in% names(attr_data)) {
+      attr_data <- dplyr::filter(attr_data, .data[[area_col]] == focus_area)
+      fill_var <- "Metric"
+      x_var <- "year"
+    } else {
+      warning("focus_area ignored: no matching column for the selected level.")
+    }
+  }
+  
+  groups <- switch(level,
+                   country = "year",
+                   region = c("region", "year"),
+                   district = c("region", "district", "year"))
+  
+  required <- unique(c(groups, metrics))
+  missing <- setdiff(required, names(attr_data))
+  if (length(missing) > 0) stop("Missing columns: ", paste(missing, collapse = ", "))
+  
+  # Reshape for plotting
+  long_data <- attr_data |>
+    dplyr::select(dplyr::all_of(required)) |>
+    tidyr::pivot_longer(cols = metrics, names_to = "Metric", values_to = "Value") |>
+    dplyr::filter(!is.na(Value))
+  
+  years <- sort(unique(long_data$year))
+  plots <- list()
+  
+  make_plot <- function(df_metric, metric) {
+    df_metric <- dplyr::filter(df_metric, Metric == metric)
+    
+    if (x_var == "region") {
+      df_metric <- df_metric |>
+        dplyr::group_by(region) |>
+        dplyr::mutate(mean_value = mean(Value, na.rm = TRUE)) |>
+        dplyr::ungroup() |>
+        dplyr::mutate(region = reorder(region, -mean_value))
+    }
+    
+    one_year <- length(unique(df_metric$year)) == 1
+    plot_title <- paste(
+      "Malaria attribution -", tools::toTitleCase(level),
+      if (one_year) paste0(" (", unique(df_metric$year), ")") else "",
+      if (!is.null(focus_area)) paste0(" - ", focus_area) else ""
+    )
+    
+    p <- ggplot2::ggplot(df_metric, ggplot2::aes(x = .data[[x_var]], y = Value, fill = .data[[fill_var]])) +
+      ggplot2::geom_col(position = ggplot2::position_dodge(width = 0.9)) +
+      ggplot2::geom_text(ggplot2::aes(label = round(Value, 1)),
+                         position = ggplot2::position_dodge(width = 0.9),
+                         vjust = -0.3, size = 3.5) +
+      ggplot2::facet_wrap(~ Metric, scales = "free_y", labeller = ggplot2::labeller(Metric = metric_labels)) +
+      ggplot2::labs(
+        title = plot_title,
+        x = tools::toTitleCase(x_var),
+        y = NULL,
+        fill = tools::toTitleCase(fill_var)
+      ) +
+      ggplot2::scale_x_discrete(drop = FALSE) +
+      ggplot2::theme_minimal(base_size = 14) +
+      ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 45, hjust = 1))
+    
+    if (x_var == "year") {
+      p <- p + ggplot2::scale_x_continuous(
+        breaks = seq(min(df_metric$year, na.rm = TRUE), max(df_metric$year, na.rm = TRUE), by = 1),
+        labels = as.integer
+      )
+    }
+    
+    return(p)
+  }
+  
+  for (metric in metrics) {
+    df_metric <- dplyr::filter(long_data, Metric == metric)
+    plots[[metric]] <- if (level %in% c("region", "district") && is.null(filter_year) && is.null(focus_area)) {
+      lapply(years, function(yr) make_plot(dplyr::filter(df_metric, year == yr), metric))
+    } else {
+      list(make_plot(df_metric, metric))
+    }
+  }
+  
+  if (save_fig && !is.null(output_dir)) {
+    dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+    for (metric in names(plots)) {
+      suffix <- if (!is.null(focus_area)) paste0("_", gsub(" ", "_", tolower(focus_area))) else ""
+      pdf_path <- file.path(output_dir, paste0("attribution_", level, "_", metric, suffix, ".pdf"))
+      grDevices::pdf(pdf_path, width = 12, height = 8)
+      purrr::walk(plots[[metric]], print)
+      grDevices::dev.off()
+      message("Saved plot for ", metric, " to: ", pdf_path)
+    }
+  }
+  
+  return(plots)
+}
+```
+
