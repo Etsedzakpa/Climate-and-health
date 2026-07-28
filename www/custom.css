@@ -1,0 +1,100 @@
+.card {
+  border-radius: 15px !important;
+}
+
+.value-box {
+  font-size: 1.3rem;
+  font-weight: bold;
+}
+
+body {
+  font-family: 'Inter', sans-serif;
+}
+
+
+.legend {
+  margin: 20px 0;
+  padding: 15px;
+  background-color: #f8f9fa;
+  border-radius: 5px;
+}
+
+.legend-item {
+  display: inline-block;
+  margin-right: 20px;
+  margin-bottom: 10px;
+}
+
+.legend-color {
+  display: inline-block;
+  width: 20px;
+  height: 20px;
+  margin-right: 8px;
+  vertical-align: middle;
+  border: 1px solid #999;
+}
+
+.main-footer-custom {
+  padding: 16px 24px 12px;
+  background-color: white;   /* adjust to your theme */
+  color: #cccccc;
+}
+
+/* ── partner section ── */
+.footer-partners {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 40px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+
+.footer-partners-label {
+  font-size: 12px;
+  color: #aaaaaa;
+  white-space: nowrap;
+}
+
+.footer-logos {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  flex-wrap: wrap;
+}
+
+.partner-logo {
+  height: 70px;
+  width: auto;
+  object-fit: contain;
+  opacity: 0.85;
+  transition: opacity 0.2s;
+}
+
+.partner-logo:hover {
+  opacity: 1;
+}
+
+/* ── divider ── */
+.footer-divider {
+  border: none;
+  border-top: 1px solid rgba(255, 255, 255, 0.12);
+  margin: 8px 0;
+}
+
+/* ── copyright ── */
+.footer-copyright {
+  text-align: center;
+  font-size: 11px;
+  color: #888888;
+  padding-bottom: 4px;
+}
+
+
+.radio-inline label {
+  font-size: 8px;
+}
+
+.btn-tool i {
+    font-size: 16px;
+}
