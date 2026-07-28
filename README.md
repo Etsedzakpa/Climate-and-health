@@ -1,1 +1,2 @@
-# Climate-and-health
+# SOSCHI-NISR CLIMATE AND HEALTH PLATFORM
+
